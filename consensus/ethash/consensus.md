@@ -1,5 +1,5 @@
 ### Author()  
-返回挖出该区块的矿工的接受奖励的地址
+返回挖出该区块的矿工的接受奖励的地址。
 ```
 // Author implements consensus.Engine, returning the header's coinbase as the
 // proof-of-work verified author of the block.
@@ -7,8 +7,8 @@ func (ethash *Ethash) Author(header *types.Header) (common.Address, error) {
 	return header.Coinbase, nil
 }
 ```
-  
-  
+
+
 ### VerifyHeader()  
 判断当前状态是否为ModeFullFake；  
 判断该区块头是否已经存在；  
@@ -136,6 +136,76 @@ func (ethash *Ethash) verifyHeaderWorker(chain consensus.ChainReader, headers []
 ```
 
 
+### VerifyUncles()  
+验证该区块的叔块：  
+判断模式是否为测试模式（ModeFullFake）；  
+判断包含的叔区块是否超过2个；
+验证叔区块是否合乎以太坊标准（7代以内，区块头有效，未曾以叔区块的身份出现过）。
+```
+// VerifyUncles verifies that the given  block's uncles conform to the consensus
+// rules of the stock Ethereum ethash engine.
+func (ethash *Ethash) VerifyUncles(chain consensus.ChainReader, block *types.Block) error {
+	// If we're running a full engine faking, accept any input as valid
+	// 模式为ModeFullFake（测试用）时，任意输入均有效
+	if ethash.config.PowMode == ModeFullFake {
+		return nil
+	}
+	// Verify that there are at most 2 uncles included in this block
+	// 区块中最多包括2个叔区块（maxUnlces = 2）
+	if len(block.Uncles()) > maxUncles {
+		return errTooManyUncles
+	}
+	// Gather the set of past uncles and ancestors
+	uncles, ancestors := set.New(), make(map[common.Hash]*types.Header)
+
+	// number存放父区块的区块号
+	// parent存放父区块的哈希值
+	number, parent := block.NumberU64()-1, block.ParentHash()
+	// 将该区块及其上数7代祖先存入ancestors中
+	for i := 0; i < 7; i++ {
+		ancestor := chain.GetBlock(parent, number)
+		if ancestor == nil {
+			break
+		}
+		ancestors[ancestor.Hash()] = ancestor.Header()
+		for _, uncle := range ancestor.Uncles() {
+			uncles.Add(uncle.Hash())
+		}
+		parent, number = ancestor.ParentHash(), number-1
+	}
+	ancestors[block.Hash()] = block.Header()
+	uncles.Add(block.Hash())
+
+	// Verify each of the uncles that it's recent, but not an ancestor
+	for _, uncle := range block.Uncles() {
+		// Make sure every uncle is rewarded only once
+		hash := uncle.Hash()
+		// 若该叔块已被奖励过（即已是之前某块的叔块），则返回错误类型errDuplicateUncle
+		if uncles.Has(hash) {
+			return errDuplicateUncle
+		}
+		// 未被奖励过则存入uncles中
+		uncles.Add(hash)
+
+		// Make sure the uncle has a valid ancestry
+		// 该叔块已是该区块的祖先，则返回错误类型errUncleIsAncestor
+		if ancestors[hash] != nil {
+			return errUncleIsAncestor
+		}
+		// 叔块的父区块不在该区块的祖先中（即其实并不是叔块），或叔块的父区块即该区块的父区块（即与该区块为兄弟节点），则返回错误类型errDanglingUncle
+		if ancestors[uncle.ParentHash] == nil || uncle.ParentHash == block.ParentHash() {
+			return errDanglingUncle
+		}
+		// 验证该叔块的区块头是否有效
+		if err := ethash.verifyHeader(chain, uncle, ancestors[uncle.ParentHash], true, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+
 
 ### verifyHeader()  
 判断区块头中附加数据的长度是否超过参数中规定的附加数据的最大长度；  
@@ -146,7 +216,7 @@ func (ethash *Ethash) verifyHeaderWorker(chain consensus.ChainReader, headers []
 验证该区块的gas limit是否满足参数设定；  
 验证该区块的区块号是否是其父区块的区块号+1；   
 验证封装，调用VerifySeal()；  
-验证判断该区块是否和DAO的硬分叉有关；  
+判断该区块是否和DAO的硬分叉有关；  
 验证EIP 150分叉时的区块hash是否正确。  
 ```
 // verifyHeader checks whether a header conforms to the consensus rules of the
@@ -158,8 +228,8 @@ func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *
 		return fmt.Errorf("extra-data too long: %d > %d", len(header.Extra), params.MaximumExtraDataSize)
 	}
 	// Verify the header's timestamp
-	// 若该区块有叔节点，验证其时间戳是否大于2^256-1（MaxBig256定义在common\math\big.go中）；  
-	// 若无叔节点，判断该区块的时间戳是否超过了所允许的某未来时间节点（allowedFutureBolcktime被规定为15s）；
+	// 若该区块是叔节点，验证其时间戳是否大于2^256-1（MaxBig256定义在common\math\big.go中）；  
+	// 若不是叔节点，判断该区块的时间戳是否超过了所允许的某未来时间节点（allowedFutureBolcktime被规定为15s）；
 	if uncle {
 		if header.Time.Cmp(math.MaxBig256) > 0 {
 			return errLargeBlockTime
@@ -222,6 +292,129 @@ func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *
 	return nil
 }
 ```
+
+
+### CalcDifficulty()
+调用CalcDifficulty()计算该区块的挖矿难度。
+```
+// CalcDifficulty is the difficulty adjustment algorithm. It returns
+// the difficulty that a new block should have when created at time
+// given the parent block's time and difficulty.
+func (ethash *Ethash) CalcDifficulty(chain consensus.ChainReader, time uint64, parent *types.Header) *big.Int {
+	return CalcDifficulty(chain.Config(), time, parent)
+}
+```
+
+
+### CalcDifficulty()  
+被上一函数调用，区别在于输入参数不一样。  
+主要功能是根据config参数决定调用何种难度计算方式，使用该区块的时间戳和其父区块的区块号来计算该区块的挖矿难度：  
+判断该区块处于Byzantium阶段或Homestead阶段或Frontier阶段（根据params\config.go，目前均处于Byzantium阶段），并调用相应的难度计算函数。  
+```
+// CalcDifficulty is the difficulty adjustment algorithm. It returns
+// the difficulty that a new block should have when created at time
+// given the parent block's time and difficulty.
+func CalcDifficulty(config *params.ChainConfig, time uint64, parent *types.Header) *big.Int {
+	next := new(big.Int).Add(parent.Number, big1)
+	switch {
+	case config.IsByzantium(next):
+		return calcDifficultyByzantium(time, parent)
+	case config.IsHomestead(next):
+		return calcDifficultyHomestead(time, parent)
+	default:
+		return calcDifficultyFrontier(time, parent)
+	}
+}
+```
+
+### calcDifficultyByzantium()    
+
+父区块有叔块：
+
+diff = ( parent_diff + ( parent_diff / 2048 * max( 2 - (timestamp - parent.timestamp) / 9) , -99 ) + 2 ^ ( periodCount - 2 )
+
+父区块无叔块：
+
+diff = ( parent_diff + ( parent_diff / 2048 * max( 1 - (timestamp - parent.timestamp) / 9) , -99 ) + 2 ^ ( periodCount - 2 )
+
+```
+// calcDifficultyByzantium is the difficulty adjustment algorithm. It returns
+// the difficulty that a new block should have when created at time given the
+// parent block's time and difficulty. The calculation uses the Byzantium rules.
+func calcDifficultyByzantium(time uint64, parent *types.Header) *big.Int {
+	// https://github.com/ethereum/EIPs/issues/100.
+	// algorithm:
+	// diff = (parent_diff +
+	//         (parent_diff / 2048 * max((2 if len(parent.uncles) else 1) - ((timestamp - parent.timestamp) // 9), -99))
+	//        ) + 2^(periodCount - 2)
+
+	// bigTime存储该区块的时间戳
+	// bigParentTime存储其父区块的时间戳
+	bigTime := new(big.Int).SetUint64(time)
+	bigParentTime := new(big.Int).Set(parent.Time)
+
+	// holds intermediate values to make the algo easier to read & audit
+	x := new(big.Int)
+	y := new(big.Int)
+
+	// (2 if len(parent_uncles) else 1) - (block_timestamp - parent_timestamp) // 9
+	// x = (bigTime - bigParentTime) / 9 （即x为该区块与父区块的时间戳的差值再除以9）
+	// 如果父区块有叔块，则 x = 2 - x ，否则 x = 1 - x
+	x.Sub(bigTime, bigParentTime)
+	x.Div(x, big9)
+	if parent.UncleHash == types.EmptyUncleHash {
+		x.Sub(big1, x)
+	} else {
+		x.Sub(big2, x)
+	}
+	// max((2 if len(parent_uncles) else 1) - (block_timestamp - parent_timestamp) // 9, -99)
+	// 比较x与-99，取它们中较大的值赋给x
+	if x.Cmp(bigMinus99) < 0 {
+		x.Set(bigMinus99)
+	}
+	// parent_diff + (parent_diff / 2048 * max((2 if len(parent.uncles) else 1) - ((timestamp - parent.timestamp) // 9), -99))
+	// y = parent_diff / 2048 (DifficultyBoundDivisor定义在params\protocol_params.go中)
+	y.Div(parent.Difficulty, params.DifficultyBoundDivisor)
+	// x = y * x
+	x.Mul(y, x)
+	// x = parent_diff + x
+	x.Add(parent.Difficulty, x)
+
+	// minimum difficulty can ever be (before exponential factor)
+	// 比较x与131072，取其中较大的赋值给x（MinimumDifficulty定义在params\protocol_params.go中）
+	if x.Cmp(params.MinimumDifficulty) < 0 {
+		x.Set(params.MinimumDifficulty)
+	}
+	// calculate a fake block number for the ice-age delay:
+	//   https://github.com/ethereum/EIPs/pull/669
+	//   fake_block_number = min(0, block.number - 3_000_000
+	// ice-age : 冰河期
+	// "bomb" ：难度炸弹
+	// 冰河期指出块速度越来越慢（挖矿难度极高），为了由PoW转为PoS所设定的难度机制
+	// 原有的注释错误，应改为fakeBlockNumber = max(0, block.number - 3_000_000)
+	fakeBlockNumber := new(big.Int)
+	if parent.Number.Cmp(big2999999) >= 0 {
+		fakeBlockNumber = fakeBlockNumber.Sub(parent.Number, big2999999) // Note, parent is 1 less than the actual block number
+	}
+	// for the exponential factor
+	// periodCount = fakeBlockNumber / 100000，比如现在的periodCount = 25(2018.5.8)
+	periodCount := fakeBlockNumber
+	periodCount.Div(periodCount, expDiffPeriod)
+
+	// the exponential factor, commonly referred to as "the bomb"
+	// diff = diff + 2^(periodCount - 2)
+	// 此处就是"bomb"的实现，随着时间迁移，难度将指数级增长
+	if periodCount.Cmp(big1) > 0 {
+		y.Sub(periodCount, big2)
+		y.Exp(big2, y, nil)
+		x.Add(x, y)
+	}
+	return x
+}
+```
+
+
+
 ### VerifySeal()  
 判断该区块的模式是否为ModeFake或ModeFullFake（这2种模式通常是测试时使用）；  
 判断当前PoW类型是否为shared（通常测试用），若是，则转而验证该shared型；  
