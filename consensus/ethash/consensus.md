@@ -205,8 +205,6 @@ func (ethash *Ethash) VerifyUncles(chain consensus.ChainReader, block *types.Blo
 }
 ```
 
-
-
 ### verifyHeader()  
 判断区块头中附加数据的长度是否超过参数中规定的附加数据的最大长度；  
 验证区块头的时间戳;  
@@ -331,11 +329,11 @@ func CalcDifficulty(config *params.ChainConfig, time uint64, parent *types.Heade
 
 父区块有叔块：
 
-diff = ( parent_diff + ( parent_diff / 2048 * max( 2 - (timestamp - parent.timestamp) / 9) , -99 ) + 2 ^ ( periodCount - 2 )
+diff = max ( parent_diff + parent_diff / 2048 * max ( 2 - (timestamp - parent.timestamp) / 9 , -99 ) , 131072 ) + 2 ^ ( periodCount - 2 )
 
 父区块无叔块：
 
-diff = ( parent_diff + ( parent_diff / 2048 * max( 1 - (timestamp - parent.timestamp) / 9) , -99 ) + 2 ^ ( periodCount - 2 )
+diff = max ( parent_diff + parent_diff / 2048 * max ( 1 - (timestamp - parent.timestamp) / 9 , -99 ) , 131072 ) + 2 ^ ( periodCount - 2 )
 
 ```
 // calcDifficultyByzantium is the difficulty adjustment algorithm. It returns
@@ -413,7 +411,124 @@ func calcDifficultyByzantium(time uint64, parent *types.Header) *big.Int {
 }
 ```
 
+### calcDifficultyHomestead() 
 
+diff = max ( parent_diff + parent_diff / 2048 * max ( 1 - (timestamp - parent.timestamp) / 10 , -99 ) , 131072 ) + 2 ^ ( periodCount - 2 )
+
+```
+// calcDifficultyHomestead is the difficulty adjustment algorithm. It returns
+// the difficulty that a new block should have when created at time given the
+// parent block's time and difficulty. The calculation uses the Homestead rules.
+func calcDifficultyHomestead(time uint64, parent *types.Header) *big.Int {
+	// https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2.md
+	// algorithm:
+	// diff = (parent_diff +
+	//         (parent_diff / 2048 * max(1 - (block_timestamp - parent_timestamp) // 10, -99))
+	//        ) + 2^(periodCount - 2)
+
+	bigTime := new(big.Int).SetUint64(time)
+	bigParentTime := new(big.Int).Set(parent.Time)
+
+	// holds intermediate values to make the algo easier to read & audit
+	x := new(big.Int)
+	y := new(big.Int)
+
+	// 1 - (block_timestamp - parent_timestamp) // 10
+	x.Sub(bigTime, bigParentTime)
+	x.Div(x, big10)
+	x.Sub(big1, x)
+
+	// max(1 - (block_timestamp - parent_timestamp) // 10, -99)
+	if x.Cmp(bigMinus99) < 0 {
+		x.Set(bigMinus99)
+	}
+	// (parent_diff + parent_diff // 2048 * max(1 - (block_timestamp - parent_timestamp) // 10, -99))
+	y.Div(parent.Difficulty, params.DifficultyBoundDivisor)
+	x.Mul(y, x)
+	x.Add(parent.Difficulty, x)
+
+	// minimum difficulty can ever be (before exponential factor)
+	if x.Cmp(params.MinimumDifficulty) < 0 {
+		x.Set(params.MinimumDifficulty)
+	}
+	// for the exponential factor
+	periodCount := new(big.Int).Add(parent.Number, big1)
+	periodCount.Div(periodCount, expDiffPeriod)
+
+	// the exponential factor, commonly referred to as "the bomb"
+	// diff = diff + 2^(periodCount - 2)
+	if periodCount.Cmp(big1) > 0 {
+		y.Sub(periodCount, big2)
+		y.Exp(big2, y, nil)
+		x.Add(x, y)
+	}
+	return x
+}
+```
+
+### calcDifficultyFrontier()
+
+if (timestamp - parent.timestamp < 13)
+	diff = parent_diff + parent_diff / 2048;
+else
+	diff = parent_diff  - parent_diff / 2048;
+
+diff = max(diff, 131072) ;
+
+periodCount = (parent_number + 1) / 100000;
+
+if(periodCount > 1)
+	diff = diff + 2^(periodCount - 2);
+	diff = max(diff, 131072);
+
+return diff;
+
+```
+// calcDifficultyFrontier is the difficulty adjustment algorithm. It returns the
+// difficulty that a new block should have when created at time given the parent
+// block's time and difficulty. The calculation uses the Frontier rules.
+func calcDifficultyFrontier(time uint64, parent *types.Header) *big.Int {
+	diff := new(big.Int)
+	// adjust = parent_diff / 2048
+	adjust := new(big.Int).Div(parent.Difficulty, params.DifficultyBoundDivisor)
+	bigTime := new(big.Int)
+	bigParentTime := new(big.Int)
+
+	// bigTime = time;
+	// bigParentTime = parent.Time
+	bigTime.SetUint64(time)
+	bigParentTime.Set(parent.Time)
+
+	// if(timestamp - parent.timestamp < 13)
+	//		diff = parent_diff + parent_diff / 2048;
+	// else
+	//		diff = parent_diff - parent_diff / 2048;
+	if bigTime.Sub(bigTime, bigParentTime).Cmp(params.DurationLimit) < 0 {
+		diff.Add(parent.Difficulty, adjust)
+	} else {
+		diff.Sub(parent.Difficulty, adjust)
+	}
+	// diff = max(diff, 131072)
+	if diff.Cmp(params.MinimumDifficulty) < 0 {
+		diff.Set(params.MinimumDifficulty)
+	}
+
+	// periodCount = (parent_number + 1) / 100000
+	periodCount := new(big.Int).Add(parent.Number, big1)
+	periodCount.Div(periodCount, expDiffPeriod)
+	// if(periodCount > 1)
+	// 		diff = diff + 2^(periodCount - 2);
+	// 		diff = max(diff, 131072);
+	if periodCount.Cmp(big1) > 0 {
+		// diff = diff + 2^(periodCount - 2)
+		expDiff := periodCount.Sub(periodCount, big2)
+		expDiff.Exp(big2, expDiff, nil)
+		diff.Add(diff, expDiff)
+		diff = math.BigMax(diff, params.MinimumDifficulty)
+	}
+	return diff
+}
+```
 
 ### VerifySeal()  
 判断该区块的模式是否为ModeFake或ModeFullFake（这2种模式通常是测试时使用）；  
@@ -474,6 +589,77 @@ func (ethash *Ethash) VerifySeal(chain consensus.ChainReader, header *types.Head
 		return errInvalidPoW
 	}
 	return nil
+}
+```
+
+### Prepare()
+
+寻找该区块的父区块，若父区块不存在，返回错误类型ErrUnknownAncestor；
+
+计算该区块的挖矿难度。
+
+```
+// Prepare implements consensus.Engine, initializing the difficulty field of a
+// header to conform to the ethash protocol. The changes are done inline.
+func (ethash *Ethash) Prepare(chain consensus.ChainReader, header *types.Header) error {
+	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
+	if parent == nil {
+		return consensus.ErrUnknownAncestor
+	}
+	header.Difficulty = ethash.CalcDifficulty(chain, header.Time.Uint64(), parent)
+	return nil
+}
+```
+
+### Finalize()
+
+调用accumulateRewards()计算当前区块和其叔块的挖矿奖励；
+
+生成header.Root（即黄皮书中所表述的stateRoot，区块定稿后可生成这个值）；
+
+返回一个打包了区块头、交易信息、叔块的区块头和收据的块。
+
+```
+// Finalize implements consensus.Engine, accumulating the block and uncle rewards,
+// setting the final state and assembling the block.
+func (ethash *Ethash) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+	// Accumulate any block and uncle rewards and commit the final state root
+	accumulateRewards(chain.Config(), state, header, uncles)
+	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+
+	// Header seems complete, assemble into a block and return
+	return types.NewBlock(header, txs, uncles, receipts), nil
+}
+```
+
+### accumulateRewards()
+
+```
+// AccumulateRewards credits the coinbase of the given block with the mining
+// reward. The total reward consists of the static block reward and rewards for
+// included uncles. The coinbase of each uncle block is also rewarded.
+func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
+	// Select the correct block reward based on chain progression
+	// blockReward = 5e+18
+	blockReward := FrontierBlockReward
+	// 如果当前区块处于Byzantium阶段，则blockReward = 3e+18
+	if config.IsByzantium(header.Number) {
+		blockReward = ByzantiumBlockReward
+	}
+	// Accumulate the rewards for the miner and any included uncles
+	reward := new(big.Int).Set(blockReward)
+	r := new(big.Int)
+	for _, uncle := range uncles {
+		r.Add(uncle.Number, big8)
+		r.Sub(r, header.Number)
+		r.Mul(r, blockReward)
+		r.Div(r, big8)
+		state.AddBalance(uncle.Coinbase, r)
+
+		r.Div(blockReward, big32)
+		reward.Add(reward, r)
+	}
+	state.AddBalance(header.Coinbase, reward)
 }
 ```
 
